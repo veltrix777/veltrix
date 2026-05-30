@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>VELTRIX Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700;900&family=Cinzel:wght@400;600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css"/>
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getFirestore, collection, addDoc, getDocs, query, orderBy, doc, updateDoc, increment, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
+
+// ======================================================
+// 🔥 ضع إعدادات Firebase هنا بعد ما تنشئ المشروع
+// ======================================================
+const firebaseConfig = {
+  apiKey: "PASTE_YOUR_API_KEY",
+  authDomain: "PASTE_YOUR_AUTH_DOMAIN",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  storageBucket: "PASTE_YOUR_STORAGE_BUCKET",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID",
+  appId: "PASTE_YOUR_APP_ID"
+};
+
+const ADMIN_PASSWORD = "veltrix2025"; // 🔐 غيّر هذا لكلمة سر قوية
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const storage = getStorage(app);
+
+// ---- State ----
+let games = [];
+let isAdmin = false;
+let activeGame = null;
+
+// ---- Particles ----
+const canvas = document.getElementById('particles');
+const ctx = canvas.getContext('2d');
+let pts = [];
+function resizeCanvas() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+resizeCanvas(); window.addEventListener('resize', resizeCanvas);
+for (let i = 0; i < 70; i++) pts.push({
+  x: Math.random()*1600, y: Math.random()*900,
+  r: Math.random()*1.4+0.3,
+  vx: (Math.random()-0.5)*0.12, vy: -Math.random()*0.28-0.04,
+  a: Math.random(), gold: Math.random()>0.45
+});
+function drawParticles() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  pts.forEach(p => {
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+    ctx.fillStyle = p.gold ? `rgba(201,168,76,${p.a*0.55})` : `rgba(192,68,10,${p.a*0.38})`;
+    ctx.fill();
+    p.x+=p.vx; p.y+=p.vy;
+    p.a = 0.3+0.7*Math.sin(Date.now()*0.001+p.x*0.01);
+    if(p.y<-5){p.y=canvas.height+5;p.x=Math.random()*canvas.width}
+    if(p.x<0||p.x>canvas.width) p.vx*=-1;
+  });
+  requestAnimationFrame(drawParticles);
+}
+drawParticles();
+
+// ---- Load Games ----
+async function loadGames() {
+  const grid = document.getElementById('gamesGrid');
+  const emptyMsg = document.getElementById('emptyMsg');
+  grid.innerHTML = '';
+  try {
+    const q = query(collection(db,"games"), orderBy("createdAt","desc"));
+    const snap = await getDocs(q);
+    games = [];
+    snap.forEach(d => games.push({id:d.id,...d.data()}));
+    if (games.length === 0) {
+      emptyMsg.style.display = 'block';
+    } else {
+      emptyMsg.style.display = 'none';
+      games.forEach(g => grid.appendChild(buildCard(g)));
+    }
+  } catch(e) {
+    emptyMsg.style.display = 'block';
+    console.error(e);
+  }
+}
+
+function buildCard(g) {
+  const div = document.createElement('div');
+  div.className = 'game-card';
+  div.dataset.name = (g.title||'').toLowerCase();
+  div.dataset.genre = (g.genre||'').toLowerCase();
+  const stars = '★'.repeat(Math.round(g.avgRating||0)) + '☆'.repeat(5-Math.round(g.avgRating||0));
+  div.innerHTML = `
+    <div class="card-thumb">
+      ${g.imageUrl ? `<img src="${g.imageUrl}" alt="${g.title}" class="card-img"/>` : `<div class="card-no-img"><i class="ti ti-sword"></i></div>`}
+      <div class="card-play"><div class="play-circle"><i class="ti ti-eye"></i></div></div>
+      ${isAdmin ? `<div class="admin-del" data-id="${g.id}" data-img="${g.imagePath||''}">✕</div>` : ''}
+    </div>
+    <div class="card-body">
+      <div class="card-title">${g.title||''}</div>
+      <div class="card-desc">${(g.description||'').substring(0,80)}${(g.description||'').length>80?'...':''}</div>
+      <div class="card-meta">
+        <div class="card-stars">${stars}</div>
+        <div class="card-counts"><i class="ti ti-message"></i> ${g.commentCount||0}</div>
+      </div>
+    </div>`;
+  div.addEventListener('click', e => {
+    if(e.target.closest('.admin-del')) return;
+    openGame(g);
+  });
+  if(isAdmin) {
+    div.querySelector('.admin-del').addEventListener('click', e => { e.stopPropagation(); deleteGame(g); });
+  }
+  return div;
+}
+
+// ---- Search ----
+document.getElementById('searchBox').addEventListener('input', function() {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.game-card').forEach(c => {
+    c.style.display = (c.dataset.name.includes(q)||c.dataset.genre.includes(q)||q==='') ? '' : 'none';
+  });
+});
+
+// ---- Open Game Modal ----
+async function openGame(g) {
+  activeGame = g;
+  document.getElementById('modalTitle').textContent = g.title||'';
+  document.getElementById('modalDesc').textContent = g.description||'';
+  document.getElementById('modalGenre').textContent = g.genre||'';
+  const img = document.getElementById('modalImg');
+  if(g.imageUrl){ img.src=g.imageUrl; img.style.display='block'; }
+  else img.style.display='none';
+
+  // Download button - only show if downloadUrl exists
+  const dlBtn = document.getElementById('modalDlBtn');
+  if(g.downloadUrl){ dlBtn.style.display='inline-flex'; dlBtn.href=g.downloadUrl; }
+  else dlBtn.style.display='none';
+
+  await loadComments(g.id);
+  document.getElementById('gameModal').style.display='flex';
+  document.body.style.overflow='hidden';
+}
+
+document.getElementById('modalClose').addEventListener('click', closeModal);
+document.getElementById('gameModal').addEventListener('click', e => { if(e.target===document.getElementById('gameModal')) closeModal(); });
+function closeModal(){ document.getElementById('gameModal').style.display='none'; document.body.style.overflow=''; activeGame=null; }
+
+// ---- Comments ----
+async function loadComments(gameId) {
+  const list = document.getElementById('commentsList');
+  list.innerHTML = '<div style="color:rgba(212,197,169,0.3);font-size:12px;text-align:center;padding:16px">جاري التحميل...</div>';
+  try {
+    const q = query(collection(db,`games/${gameId}/comments`), orderBy("createdAt","desc"));
+    const snap = await getDocs(q);
+    list.innerHTML = '';
+    if(snap.empty){ list.innerHTML = '<div style="color:rgba(212,197,169,0.25);font-size:12px;text-align:center;padding:16px">لا توجد تعليقات بعد. كن أول من يعلق!</div>'; return; }
+    snap.forEach(d => {
+      const c = d.data();
+      const el = document.createElement('div');
+      el.className = 'comment-item';
+      const stars = '★'.repeat(c.rating||0)+'☆'.repeat(5-(c.rating||0));
+      el.innerHTML = `
+        <div class="comment-header">
+          <div class="comment-avatar">${(c.name||'?')[0].toUpperCase()}</div>
+          <div>
+            <div class="comment-name">${c.name||'مجهول'}</div>
+            <div class="comment-stars">${stars}</div>
+          </div>
+          <div class="comment-date">${c.createdAt ? new Date(c.createdAt.seconds*1000).toLocaleDateString('ar') : ''}</div>
+        </div>
+        <div class="comment-text">${c.text||''}</div>
+        <div class="comment-actions">
+          <span class="like-btn" data-id="${d.id}" data-gid="${gameId}"><i class="ti ti-thumb-up"></i> ${c.likes||0}</span>
+        </div>`;
+      el.querySelector('.like-btn').addEventListener('click', async function(){
+        await updateDoc(doc(db,`games/${gameId}/comments`,d.id),{likes:increment(1)});
+        this.innerHTML = `<i class="ti ti-thumb-up"></i> ${(c.likes||0)+1}`;
+      });
+      list.appendChild(el);
+    });
+  } catch(e){ list.innerHTML='<div style="color:#c0440a;font-size:12px;text-align:center;padding:16px">خطأ في تحميل التعليقات</div>'; }
+}
+
+// ---- Submit Comment ----
+let selectedRating = 0;
+document.querySelectorAll('.star-btn').forEach(s => {
+  s.addEventListener('click', function(){
+    selectedRating = +this.dataset.val;
+    document.querySelectorAll('.star-btn').forEach((b,i) => b.classList.toggle('active', i<selectedRating));
+  });
+});
+
+document.getElementById('submitComment').addEventListener('click', async () => {
+  const name = document.getElementById('commentName').value.trim();
+  const text = document.getElementById('commentText').value.trim();
+  if(!name||!text){ alert('اكتب اسمك وتعليقك'); return; }
+  if(!selectedRating){ alert('اختر تقييم'); return; }
+  if(!activeGame) return;
+  const btn = document.getElementById('submitComment');
+  btn.disabled=true; btn.textContent='جاري الإرسال...';
+  try {
+    await addDoc(collection(db,`games/${activeGame.id}/comments`),{
+      name, text, rating: selectedRating, likes:0, createdAt: new Date()
+    });
+    // Update avgRating
+    const snap = await getDocs(collection(db,`games/${activeGame.id}/comments`));
+    let total=0,count=0;
+    snap.forEach(d=>{total+=(d.data().rating||0);count++;});
+    await updateDoc(doc(db,"games",activeGame.id),{avgRating:total/count, commentCount:count});
+    document.getElementById('commentName').value='';
+    document.getElementById('commentText').value='';
+    selectedRating=0;
+    document.querySelectorAll('.star-btn').forEach(b=>b.classList.remove('active'));
+    await loadComments(activeGame.id);
+    await loadGames();
+  } catch(e){ alert('حدث خطأ، تحقق من إعدادات Firebase'); }
+  btn.disabled=false; btn.textContent='إرسال التعليق';
+});
+
+// ---- Admin Login ----
+document.getElementById('adminLoginBtn').addEventListener('click', () => {
+  document.getElementById('adminLoginModal').style.display='flex';
+});
+document.getElementById('adminLoginModal').addEventListener('click', e => {
+  if(e.target===document.getElementById('adminLoginModal')) document.getElementById('adminLoginModal').style.display='none';
+});
+document.getElementById('doLogin').addEventListener('click', () => {
+  const pw = document.getElementById('adminPw').value;
+  if(pw===ADMIN_PASSWORD){
+    isAdmin=true;
+    document.getElementById('adminLoginModal').style.display='none';
+    document.getElementById('adminPanel').style.display='block';
+    document.getElementById('adminLoginBtn').style.display='none';
+    loadGames();
+  } else {
+    document.getElementById('loginError').style.display='block';
+  }
+});
+
+// ---- Admin Upload Game ----
+document.getElementById('uploadGameBtn').addEventListener('click', async () => {
+  const title = document.getElementById('gameTitle').value.trim();
+  const desc = document.getElementById('gameDesc').value.trim();
+  const genre = document.getElementById('gameGenre').value.trim();
+  const downloadUrl = document.getElementById('gameDownloadUrl').value.trim();
+  const imgFile = document.getElementById('gameImage').files[0];
+  if(!title||!desc){ alert('العنوان والوصف مطلوبان'); return; }
+  const btn = document.getElementById('uploadGameBtn');
+  btn.disabled=true; btn.textContent='جاري الرفع...';
+  try {
+    let imageUrl='', imagePath='';
+    if(imgFile){
+      imagePath = `games/${Date.now()}_${imgFile.name}`;
+      const imgRef = ref(storage, imagePath);
+      await uploadBytes(imgRef, imgFile);
+      imageUrl = await getDownloadURL(imgRef);
+    }
+    await addDoc(collection(db,"games"),{
+      title, description:desc, genre, downloadUrl, imageUrl, imagePath,
+      avgRating:0, commentCount:0, createdAt:new Date()
+    });
+    document.getElementById('gameTitle').value='';
+    document.getElementById('gameDesc').value='';
+    document.getElementById('gameGenre').value='';
+    document.getElementById('gameDownloadUrl').value='';
+    document.getElementById('gameImage').value='';
+    document.getElementById('uploadStatus').textContent='✓ تم نشر اللعبة بنجاح!';
+    document.getElementById('uploadStatus').style.color='#5dcaa5';
+    setTimeout(()=>document.getElementById('uploadStatus').textContent='',3000);
+    await loadGames();
+  } catch(e){ alert('خطأ: '+e.message); }
+  btn.disabled=false; btn.textContent='نشر اللعبة';
+});
+
+// ---- Delete Game ----
+async function deleteGame(g) {
+  if(!confirm(`حذف "${g.title}"؟`)) return;
+  try {
+    if(g.imagePath){ await deleteObject(ref(storage,g.imagePath)).catch(()=>{}); }
+    await deleteDoc(doc(db,"games",g.id));
+    await loadGames();
+  } catch(e){ alert('خطأ في الحذف'); }
+}
+
+// ---- Init ----
+loadGames();
+</script>
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--gold:#c9a84c;--gold-light:#e8c97a;--gold-dark:#7a5e1e;--ember:#c0440a;--ember-light:#e8682a;--bg:#080608;--bg2:#0e0a0c;--bg3:#120d10;--border-gold:rgba(201,168,76,0.22)}
+html,body{min-height:100vh;background:var(--bg);color:#d4c5a9;font-family:'Cinzel',serif;overflow-x:hidden}
+canvas#particles{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;opacity:0.45}
+
+/* NAV */
+nav{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:15px 28px;border-bottom:0.5px solid var(--border-gold);background:rgba(8,6,8,0.92);backdrop-filter:blur(10px)}
+.logo{font-family:'Cinzel Decorative',serif;font-size:20px;font-weight:900;letter-spacing:3px;color:var(--gold)}
+.nav-right{display:flex;align-items:center;gap:20px}
+.nav-links{display:flex;gap:22px;font-size:10px;letter-spacing:2px;text-transform:uppercase}
+.nav-links a{color:rgba(212,197,169,0.45);text-decoration:none;transition:color .2s;cursor:pointer}
+.nav-links a:hover{color:var(--gold)}
+#adminLoginBtn{font-family:'Cinzel',serif;font-size:9px;letter-spacing:2px;text-transform:uppercase;background:transparent;border:0.5px solid var(--border-gold);color:rgba(201,168,76,0.5);padding:6px 14px;border-radius:2px;cursor:pointer;transition:all .2s}
+#adminLoginBtn:hover{border-color:var(--gold);color:var(--gold)}
+
+/* HERO */
+.hero{position:relative;z-index:5;text-align:center;padding:56px 24px 44px;border-bottom:0.5px solid var(--border-gold)}
+.hero-eyebrow{font-size:9px;letter-spacing:4px;text-transform:uppercase;color:var(--ember-light);margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:10px}
+.hero-eyebrow::before,.hero-eyebrow::after{content:'';flex:1;max-width:55px;height:0.5px;background:linear-gradient(90deg,transparent,var(--ember))}
+.studio-name{font-family:'Cinzel Decorative',serif;font-size:clamp(38px,9vw,68px);font-weight:900;letter-spacing:6px;line-height:1;background:linear-gradient(135deg,var(--gold-dark) 0%,var(--gold-light) 40%,var(--gold) 60%,var(--gold-dark) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;animation:shimmer 4s ease-in-out infinite}
+@keyframes shimmer{0%,100%{filter:brightness(1)}50%{filter:brightness(1.18)}}
+.hero-sub{font-size:10px;letter-spacing:3px;color:rgba(212,197,169,0.35);text-transform:uppercase;margin-top:10px}
+.hero-divider{display:flex;align-items:center;justify-content:center;gap:10px;margin:24px auto;max-width:260px}
+.hero-divider::before,.hero-divider::after{content:'';flex:1;height:0.5px;background:linear-gradient(90deg,transparent,var(--border-gold))}
+.hero-divider span{color:var(--gold);font-size:14px}
+
+/* SEARCH */
+.search-wrap{position:relative;z-index:5;padding:0 24px 36px;max-width:580px;margin:0 auto}
+.search-label{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(201,168,76,0.5);margin-bottom:10px;display:block;text-align:center}
+.search-inner{position:relative}
+.search-input{width:100%;background:rgba(255,255,255,0.025);border:0.5px solid var(--border-gold);border-radius:3px;padding:13px 44px 13px 16px;font-family:'Cinzel',serif;font-size:13px;color:#d4c5a9;outline:none;transition:border-color .3s,box-shadow .3s;letter-spacing:1px}
+.search-input::placeholder{color:rgba(212,197,169,0.2);font-size:11px}
+.search-input:focus{border-color:var(--gold);box-shadow:0 0 18px rgba(201,168,76,0.08)}
+.search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--gold-dark);font-size:15px;pointer-events:none}
+
+/* GAMES SECTION */
+.games-section{position:relative;z-index:5;padding:28px 24px 52px}
+.sec-header{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+.sec-title{font-size:9px;letter-spacing:4px;text-transform:uppercase;color:rgba(201,168,76,0.55);white-space:nowrap}
+.sec-line{flex:1;height:0.5px;background:linear-gradient(90deg,var(--border-gold),transparent)}
+.games-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+#emptyMsg{display:none;text-align:center;padding:60px 20px;color:rgba(212,197,169,0.25);font-size:12px;letter-spacing:2px}
+#emptyMsg i{font-size:40px;display:block;margin-bottom:12px;color:rgba(201,168,76,0.15)}
+
+/* GAME CARD */
+.game-card{background:var(--bg3);border:0.5px solid var(--border-gold);border-radius:4px;overflow:hidden;cursor:pointer;transition:transform .3s,border-color .3s,box-shadow .3s;position:relative}
+.game-card:hover{transform:translateY(-4px);border-color:rgba(201,168,76,0.6);box-shadow:0 10px 36px rgba(201,168,76,0.1)}
+.card-thumb{height:155px;position:relative;overflow:hidden;background:#0a0608}
+.card-img{width:100%;height:100%;object-fit:cover;transition:transform .4s}
+.game-card:hover .card-img{transform:scale(1.04)}
+.card-no-img{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(201,168,76,0.12);font-size:48px}
+.card-play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(8,6,8,0.55);opacity:0;transition:opacity .3s}
+.game-card:hover .card-play{opacity:1}
+.play-circle{width:42px;height:42px;border:1.5px solid var(--gold);border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--gold);font-size:15px}
+.admin-del{position:absolute;top:8px;right:8px;background:rgba(192,68,10,0.85);color:#fff;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;cursor:pointer;z-index:10;transition:background .2s}
+.admin-del:hover{background:#c0440a}
+.card-body{padding:13px 15px}
+.card-title{font-family:'Cinzel Decorative',serif;font-size:13px;font-weight:700;color:var(--gold-light);letter-spacing:1px;margin-bottom:5px}
+.card-desc{font-size:11px;color:rgba(212,197,169,0.4);line-height:1.55;margin-bottom:10px}
+.card-meta{display:flex;align-items:center;justify-content:space-between}
+.card-stars{color:var(--gold);font-size:11px;letter-spacing:1px}
+.card-counts{font-size:10px;color:rgba(212,197,169,0.3);display:flex;align-items:center;gap:4px}
+
+/* ADMIN PANEL */
+#adminPanel{display:none;position:relative;z-index:5;border-top:0.5px solid rgba(192,68,10,0.3);background:rgba(192,68,10,0.04);padding:24px}
+.admin-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(192,68,10,0.7);margin-bottom:18px;display:flex;align-items:center;gap:10px}
+.admin-title::after{content:'';flex:1;height:0.5px;background:rgba(192,68,10,0.2)}
+.admin-form{display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:700px}
+.admin-form input,.admin-form textarea,.admin-form select{background:rgba(255,255,255,0.03);border:0.5px solid rgba(201,168,76,0.2);border-radius:3px;padding:10px 12px;font-family:'Cinzel',serif;font-size:12px;color:#d4c5a9;outline:none;transition:border-color .2s;width:100%}
+.admin-form textarea{grid-column:1/-1;resize:vertical;min-height:80px}
+.admin-form input[type=file]{color:rgba(212,197,169,0.5);font-size:11px}
+.admin-form input:focus,.admin-form textarea:focus{border-color:var(--gold)}
+.admin-form .full{grid-column:1/-1}
+#uploadGameBtn{grid-column:1/-1;font-family:'Cinzel',serif;font-size:11px;letter-spacing:2px;text-transform:uppercase;background:rgba(201,168,76,0.1);border:0.5px solid var(--gold);color:var(--gold);padding:11px;border-radius:3px;cursor:pointer;transition:all .2s}
+#uploadGameBtn:hover{background:rgba(201,168,76,0.18)}
+#uploadStatus{grid-column:1/-1;font-size:11px;letter-spacing:1px;text-align:center;min-height:18px}
+
+/* MODALS */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(4,3,5,0.88);z-index:200;align-items:center;justify-content:center;padding:16px}
+.modal-box{background:#0e0a0c;border:0.5px solid var(--border-gold);border-radius:6px;width:100%;max-width:640px;max-height:90vh;overflow-y:auto;position:relative}
+.modal-close{position:absolute;top:14px;left:14px;background:transparent;border:none;color:rgba(212,197,169,0.4);font-size:20px;cursor:pointer;line-height:1;transition:color .2s;z-index:10}
+.modal-close:hover{color:var(--gold)}
+.modal-img{width:100%;height:220px;object-fit:cover;display:block}
+.modal-content{padding:22px 24px}
+.modal-genre-badge{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--ember-light);border:0.5px solid rgba(192,68,10,0.35);padding:3px 12px;border-radius:20px;display:inline-block;margin-bottom:12px}
+.modal-title{font-family:'Cinzel Decorative',serif;font-size:22px;font-weight:900;color:var(--gold-light);letter-spacing:2px;margin-bottom:10px}
+.modal-desc{font-size:13px;color:rgba(212,197,169,0.55);line-height:1.7;margin-bottom:18px}
+.modal-dl-btn{display:inline-flex;align-items:center;gap:8px;background:rgba(201,168,76,0.1);border:0.5px solid var(--gold);color:var(--gold);font-family:'Cinzel',serif;font-size:10px;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:3px;text-decoration:none;margin-bottom:24px;transition:background .2s}
+.modal-dl-btn:hover{background:rgba(201,168,76,0.2)}
+.modal-divider{height:0.5px;background:var(--border-gold);margin-bottom:20px}
+.comments-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(201,168,76,0.45);margin-bottom:14px}
+#commentsList{margin-bottom:20px;display:flex;flex-direction:column;gap:10px}
+
+/* COMMENT ITEM */
+.comment-item{background:rgba(255,255,255,0.025);border:0.5px solid rgba(201,168,76,0.1);border-radius:4px;padding:12px 14px}
+.comment-header{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.comment-avatar{width:30px;height:30px;border-radius:50%;background:rgba(201,168,76,0.12);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:var(--gold);flex-shrink:0}
+.comment-name{font-size:12px;font-weight:600;color:rgba(212,197,169,0.8)}
+.comment-stars{font-size:10px;color:var(--gold);letter-spacing:1px}
+.comment-date{margin-right:auto;font-size:10px;color:rgba(212,197,169,0.25)}
+.comment-text{font-size:12px;color:rgba(212,197,169,0.55);line-height:1.6;margin-bottom:8px}
+.comment-actions{display:flex;gap:12px}
+.like-btn{font-size:11px;color:rgba(212,197,169,0.3);cursor:pointer;display:flex;align-items:center;gap:4px;transition:color .2s}
+.like-btn:hover{color:var(--gold)}
+
+/* NEW COMMENT FORM */
+.new-comment{margin-top:4px}
+.new-comment-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(201,168,76,0.4);margin-bottom:12px}
+.star-row{display:flex;gap:6px;margin-bottom:12px}
+.star-btn{background:transparent;border:none;font-size:20px;color:rgba(201,168,76,0.2);cursor:pointer;transition:color .15s;padding:0}
+.star-btn.active,.star-btn:hover{color:var(--gold)}
+.comment-inputs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.comment-inputs input,.new-comment textarea{background:rgba(255,255,255,0.03);border:0.5px solid rgba(201,168,76,0.18);border-radius:3px;padding:9px 12px;font-family:'Cinzel',serif;font-size:12px;color:#d4c5a9;outline:none;transition:border-color .2s;width:100%}
+.new-comment textarea{grid-column:1/-1;resize:vertical;min-height:70px;margin-bottom:8px}
+.comment-inputs input:focus,.new-comment textarea:focus{border-color:var(--gold)}
+#submitComment{width:100%;font-family:'Cinzel',serif;font-size:10px;letter-spacing:2px;text-transform:uppercase;background:rgba(201,168,76,0.08);border:0.5px solid rgba(201,168,76,0.4);color:var(--gold);padding:10px;border-radius:3px;cursor:pointer;transition:all .2s}
+#submitComment:hover{background:rgba(201,168,76,0.15)}
+
+/* LOGIN MODAL */
+#adminLoginModal .modal-box{max-width:360px;padding:36px 28px;text-align:center}
+.login-title{font-family:'Cinzel Decorative',serif;font-size:16px;color:var(--gold);margin-bottom:6px;letter-spacing:2px}
+.login-sub{font-size:10px;letter-spacing:2px;color:rgba(212,197,169,0.3);margin-bottom:24px}
+#adminPw{width:100%;background:rgba(255,255,255,0.03);border:0.5px solid var(--border-gold);border-radius:3px;padding:11px 14px;font-family:'Cinzel',serif;font-size:13px;color:#d4c5a9;outline:none;text-align:center;letter-spacing:3px;margin-bottom:12px}
+#adminPw:focus{border-color:var(--gold)}
+#doLogin{width:100%;font-family:'Cinzel',serif;font-size:10px;letter-spacing:3px;text-transform:uppercase;background:rgba(201,168,76,0.1);border:0.5px solid var(--gold);color:var(--gold);padding:11px;border-radius:3px;cursor:pointer;transition:all .2s}
+#doLogin:hover{background:rgba(201,168,76,0.2)}
+#loginError{display:none;color:#c0440a;font-size:11px;margin-top:10px;letter-spacing:1px}
+
+.ember-line{height:1px;background:linear-gradient(90deg,transparent,var(--ember),transparent);opacity:0.28}
+</style>
+</head>
+<body>
+
+<canvas id="particles"></canvas>
+
+<nav>
+  <div class="logo">VELTRIX</div>
+  <div class="nav-right">
+    <div class="nav-links">
+      <a>الألعاب</a>
+      <a>المجتمع</a>
+    </div>
+    <button id="adminLoginBtn">⚙ إدارة</button>
+  </div>
+</nav>
+<div class="ember-line"></div>
+
+<div class="hero">
+  <div class="hero-eyebrow">استوديو ألعاب مستقل</div>
+  <div class="studio-name">VELTRIX</div>
+  <div class="hero-sub">forged in godot · born from passion</div>
+  <div class="hero-divider"><span>✦</span></div>
+</div>
+
+<div class="search-wrap">
+  <span class="search-label">ابحث عن لعبة</span>
+  <div class="search-inner">
+    <input class="search-input" type="text" id="searchBox" placeholder="اكتب اسم اللعبة أو النوع..."/>
+    <i class="ti ti-search search-icon" aria-hidden="true"></i>
+  </div>
+</div>
+
+<div class="games-section">
+  <div class="sec-header">
+    <div class="sec-title">الألعاب</div>
+    <div class="sec-line"></div>
+  </div>
+  <div class="games-grid" id="gamesGrid"></div>
+  <div id="emptyMsg">
+    <i class="ti ti-sword" aria-hidden="true"></i>
+    لا توجد ألعاب منشورة بعد
+  </div>
+</div>
+
+<!-- Admin Panel -->
+<div id="adminPanel">
+  <div class="admin-title">لوحة التحكم — نشر لعبة جديدة</div>
+  <div class="admin-form">
+    <input id="gameTitle" type="text" placeholder="اسم اللعبة *"/>
+    <input id="gameGenre" type="text" placeholder="النوع (أكشن، مغامرة...)"/>
+    <textarea id="gameDesc" placeholder="وصف اللعبة *"></textarea>
+    <input id="gameImage" type="file" accept="image/*" placeholder="صورة اللعبة"/>
+    <input id="gameDownloadUrl" type="url" placeholder="رابط التحميل (اختياري)"/>
+    <div id="uploadStatus"></div>
+    <button id="uploadGameBtn">نشر اللعبة</button>
+  </div>
+</div>
+
+<!-- Game Modal -->
+<div class="modal-overlay" id="gameModal">
+  <div class="modal-box">
+    <button class="modal-close" id="modalClose">✕</button>
+    <img id="modalImg" class="modal-img" src="" alt="" style="display:none"/>
+    <div class="modal-content">
+      <div class="modal-genre-badge" id="modalGenre"></div>
+      <div class="modal-title" id="modalTitle"></div>
+      <div class="modal-desc" id="modalDesc"></div>
+      <a class="modal-dl-btn" id="modalDlBtn" href="#" target="_blank" download>
+        <i class="ti ti-download" aria-hidden="true"></i> تحميل اللعبة
+      </a>
+      <div class="modal-divider"></div>
+      <div class="comments-title">التعليقات والتقييمات</div>
+      <div id="commentsList"></div>
+      <div class="new-comment">
+        <div class="new-comment-title">أضف تعليقك</div>
+        <div class="star-row">
+          <span class="star-btn" data-val="1">★</span>
+          <span class="star-btn" data-val="2">★</span>
+          <span class="star-btn" data-val="3">★</span>
+          <span class="star-btn" data-val="4">★</span>
+          <span class="star-btn" data-val="5">★</span>
+        </div>
+        <div class="comment-inputs">
+          <input id="commentName" type="text" placeholder="اسمك"/>
+        </div>
+        <textarea id="commentText" placeholder="اكتب تعليقك..."></textarea>
+        <button id="submitComment">إرسال التعليق</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Admin Login Modal -->
+<div class="modal-overlay" id="adminLoginModal">
+  <div class="modal-box">
+    <div class="login-title">VELTRIX</div>
+    <div class="login-sub">لوحة تحكم المطور</div>
+    <input id="adminPw" type="password" placeholder="كلمة المرور"/>
+    <button id="doLogin">دخول</button>
+    <div id="loginError">كلمة المرور خاطئة</div>
+  </div>
+</div>
+
+</body>
+</html>
